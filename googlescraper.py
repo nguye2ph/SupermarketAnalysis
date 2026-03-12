@@ -1,9 +1,30 @@
 import requests
-import json
+import csv
 import time
 import random
+import logging
+import os
+from datetime import datetime
 import pandas as pd
+from tqdm import tqdm
 from pytrends.request import TrendReq
+
+# -----------------------------------------
+# Logging setup
+# -----------------------------------------
+
+os.makedirs("logs", exist_ok=True)
+log_filename = f"logs/scraper_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(log_filename),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # -----------------------------------------
 # Combined Spanish + English keyword lists
@@ -43,41 +64,44 @@ keywords = keywords_es + keywords_en
 # -----------------------------------------
 
 def get_trends(keywords, geo_list=["US-UT", "US-CO", "US-CA"]):
-    print(f"Fetching Google Trends data for {len(keywords)} keywords across Utah, Colorado, California...")
+    logger.info(f"Fetching Google Trends data for {len(keywords)} keywords across {len(geo_list)} regions...")
 
     state_abbr = {'US-UT': 'UT', 'US-CO': 'CO', 'US-CA': 'CA'}
-
-    # Split keywords into batches of 5 (pytrends limit)
     batch_size = 5
     batches = [keywords[i:i+batch_size] for i in range(0, len(keywords), batch_size)]
 
-    rows = [["city", "state"] + keywords]
+    rows = []
 
-    for geo in geo_list:
-        print(f"Processing {geo}...")
+    for geo in tqdm(geo_list, desc="Regions", unit="region"):
         state = state_abbr[geo]
-        # Collect data for each batch
+        logger.info(f"Processing region: {geo} ({state})")
         geo_data = {}
-        for batch in batches:
-            pytrends = TrendReq()
-            pytrends.build_payload(batch, timeframe="today 12-m", geo=geo)
-            data = pytrends.interest_by_region(resolution='CITY', inc_low_vol=True, inc_geo_code=False)
 
-            # data is a df with index as city, columns as batch keywords
-            for city in data.index:
-                if city not in geo_data:
-                    geo_data[city] = {}
-                for kw in batch:
-                    geo_data[city][kw] = data.loc[city, kw]
+        for batch in tqdm(batches, desc=f"  Batches [{state}]", unit="batch", leave=False):
+            try:
+                pytrends = TrendReq()
+                pytrends.build_payload(batch, timeframe="today 12-m", geo=geo)
+                data = pytrends.interest_by_region(resolution='CITY', inc_low_vol=True, inc_geo_code=False)
 
-            # Add delay to avoid rate limiting
+                for city in data.index:
+                    if city not in geo_data:
+                        geo_data[city] = {}
+                    for kw in batch:
+                        geo_data[city][kw] = data.loc[city, kw]
+
+                logger.debug(f"Fetched batch {batch} for {geo}")
+            except Exception as e:
+                logger.warning(f"Failed to fetch batch {batch} for {geo}: {e}")
+
             time.sleep(random.uniform(1, 3))
 
-        # Now, for each city in geo_data, create row
         for city, kw_dict in geo_data.items():
             values = [kw_dict.get(kw, 0) for kw in keywords]
             rows.append([city, state] + values)
 
+        logger.info(f"Collected {len(geo_data)} cities for {state}")
+
+    logger.info(f"Trends complete. Total city rows: {len(rows)}")
     return rows
 
 # -----------------------------------------
@@ -100,14 +124,14 @@ def get_hispanic_population(city, state):
                 total = int(row[1])
                 hispanic = int(row[2])
                 return hispanic, total
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Census API error for {city}, {state}: {e}")
     return None, None
 
 def get_supermarkets(city, state, keyword="latin market"):
-    api_key = "AIzaSyD5XLQ9w_5lD9Zt_kIAC_umg4YxuGcPkj8"  # Replace with your actual Google Places API key
+    api_key = "AIzaSyD5XLQ9w_5lD9Zt_kIAC_umg4YxuGcPkj8"
     if api_key == "YOUR_GOOGLE_PLACES_API_KEY":
-        print("Please set your Google Places API key in the script.")
+        logger.error("Google Places API key not set.")
         return []
     query = f"{keyword} in {city}, {state}"
     url = f"https://maps.googleapis.com/maps/api/place/textsearch/json?query={query}&key={api_key}"
@@ -122,48 +146,70 @@ def get_supermarkets(city, state, keyword="latin market"):
             lng = result.get('geometry', {}).get('location', {}).get('lng', '')
             supermarkets.append({'name': name, 'lat': lat, 'lng': lng})
         return supermarkets
-    except:
+    except Exception as e:
+        logger.warning(f"Places API error for {city}, {state}: {e}")
         return []
+
+# -----------------------------------------
+# CSV export functions
+# -----------------------------------------
+
+def export_trends_csv(data, keywords, path="output/trends.csv"):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["city", "state"] + keywords)
+        writer.writerows(data)
+    logger.info(f"Trends data saved to {path}")
+
+def export_population_csv(populations, path="output/population.csv"):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["city", "state", "hispanic_population", "total_population"])
+        for (city, state), (hispanic, total) in populations.items():
+            writer.writerow([city, state, hispanic or "N/A", total or "N/A"])
+    logger.info(f"Population data saved to {path}")
+
+def export_supermarkets_csv(supermarkets, path="output/supermarkets.csv"):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["city", "state", "supermarket_name", "latitude", "longitude"])
+        for (city, state), sups in supermarkets.items():
+            for sup in sups:
+                writer.writerow([city, state, sup['name'], sup['lat'], sup['lng']])
+    logger.info(f"Supermarket data saved to {path}")
 
 # -----------------------------------------
 # Run script
 # -----------------------------------------
 
 if __name__ == "__main__":
-    data = get_trends(keywords)
+    logger.info("=== GGTrends scraper started ===")
 
-    print("\n===== INTEREST BY CITIES IN UTAH, COLORADO, CALIFORNIA (EXCEL READY) =====")
-    print(",".join(data[0]))
-    for row in data[1:]:
-        print(",".join(str(x) for x in row))
+    trend_rows = get_trends(keywords)
+    export_trends_csv(trend_rows, keywords)
 
-    print(f"... ({len(data)-1} total cities)")
-
-    # Additional data extraction
-    print("\n===== FETCHING ADDITIONAL DATA =====")
+    logger.info("Fetching population and supermarket data...")
 
     populations = {}
     supermarkets = {}
 
-    for row in data[1:]:
+    for row in tqdm(trend_rows, desc="Cities", unit="city"):
         city, state = row[0], row[1]
         key = (city, state)
+
         if key not in populations:
-            hispanic, total = get_hispanic_population(city, state)
-            populations[key] = (hispanic, total)
+            logger.debug(f"Fetching population: {city}, {state}")
+            populations[key] = get_hispanic_population(city, state)
+
         if key not in supermarkets:
-            sups = get_supermarkets(city, state, "latin market")
-            supermarkets[key] = sups
+            logger.debug(f"Fetching supermarkets: {city}, {state}")
+            supermarkets[key] = get_supermarkets(city, state, "latin market")
 
-    print("\n===== HISPANIC POPULATION DATA =====")
-    print("city,state,hispanic_population,total_population")
-    for (city, state), (hispanic, total) in populations.items():
-        print(f"{city},{state},{hispanic if hispanic else 'N/A'},{total if total else 'N/A'}")
+    export_population_csv(populations)
+    export_supermarkets_csv(supermarkets)
 
-    print("\n===== SUPERMARKET DATA =====")
-    print("city,state,supermarket_name,latitude,longitude")
-    for (city, state), sups in supermarkets.items():
-        for sup in sups:
-            print(f"{city},{state},{sup['name']},{sup['lat']},{sup['lng']}")
-
-    print("\nNote: Supermarket square footage data is not readily available via public APIs.")
+    logger.info("=== Scraper finished. Outputs saved to output/ ===")
+    logger.info("Note: Supermarket square footage data is not readily available via public APIs.")
