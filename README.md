@@ -1,3 +1,9 @@
+## Projects have gone to steath mode 
+
+Please find public web version here: https://rancho-market-data.vercel.app/
+
+
+
 # GGTrends
 
 Market research tool for Latin/Hispanic grocery stores. Pulls Google Trends search interest, US Census Hispanic population data, and Google Places competitor listings across Utah, Colorado, and California.
